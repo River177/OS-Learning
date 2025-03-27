@@ -1,4 +1,4 @@
-# Lab: Xv6 and Unix utilities
+# Lab 1: Xv6 and Unix utilities
 
 ## sleep ([easy](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
 
@@ -357,9 +357,6 @@ void trim_quotes(char *s) {
 // 声明辅助函数原型
 void run_cmd_with_arg(int base_argc, char *base_argv[], char *arg);
 
-// 一个简易版的 xargs：
-//   xargs [-n 1] <cmd> [cmd_args...]
-// 从标准输入中读取多行，每行作为额外参数追加给 <cmd>，并执行一次。
 // 本程序仅支持 -n 1 选项，确保每次只追加一个参数。
 int
 main(int argc, char *argv[])
@@ -473,4 +470,172 @@ void run_cmd_with_arg(int base_argc, char *base_argv[], char *arg)
 ```
 
 
+
+# Lab 2: system calls
+
+## System call tracing ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+In this assignment you will add a system call tracing feature that may help you when debugging later labs. You'll create a new `trace` system call that will control tracing. It should take one argument, an integer "mask", whose bits specify which system calls to trace. For example, to trace the fork system call, a program calls `trace(1 << SYS_fork)`, where `SYS_fork` is a syscall number from `kernel/syscall.h`. You have to modify the xv6 kernel to print out a line when each system call is about to return, if the system call's number is set in the mask. The line should contain the process id, the name of the system call and the return value; you don't need to print the system call arguments. The `trace` system call should enable tracing for the process that calls it and any children that it subsequently forks, but should not affect other processes.
+
+### solution
+
+这个lab需要我们添加一个系统调用`trace`，用于在进行其他系统调用的时候进行输出调试信息。主要分以下几个步骤：
+
+1. **添加系统调用接口**
+
+在`kernel/syscall.h`中添加系统调用编号
+
+```c
+#define SYS_trace  22
+```
+
+在`user/user.h`中添加系统调用原型
+
+```c
+int trace(int);
+```
+
+在`user/usys.pl`中添加系统调用存根
+
+```c
+entry("trace");
+```
+
+2. **实现内核功能**
+
+在`kernel/proc.h`的`struct proc`中添加mask字段
+
+```c
+struct proc {
+  // 现有字段...
+  int trace_mask;   // 添加这个字段来存储trace mask
+  // 其他字段...
+};
+```
+
+在`kernel/sysproc.c`中实现`sys_trace()`函数
+
+```c
+uint64
+sys_trace(void)
+{
+  int mask;
+  //从用户空间获取mask参数
+  if(argint(0, &mask) < 0)
+    return -1;
+  //设置进程的trace_mask
+  myproc()->trace_mask = mask;
+  return 0;
+}
+```
+
+修改`kernel/proc.c`中的`fork()`函数
+
+```c
+int
+fork(void)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if((np = allocproc()) == 0){
+    return -1;
+  }
+
+  // Copy user memory from parent to child.
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+  np->sz = p->sz;
+
+  // 复制父进程的trace_mask
+  np->trace_mask = p->trace_mask;
+
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+```
+
+修改`kernel/syscall.c`
+
+添加系统调用名称数组并修改`syscall()`函数打印追踪信息
+
+```c
+// 添加系统调用名称数组
+static char *syscall_names[] = {
+[SYS_fork]    "fork",
+[SYS_exit]    "exit",
+[SYS_wait]    "wait",
+[SYS_pipe]    "pipe",
+[SYS_read]    "read",
+[SYS_kill]    "kill",
+[SYS_exec]    "exec",
+[SYS_fstat]   "fstat",
+[SYS_chdir]   "chdir",
+[SYS_dup]     "dup",
+[SYS_getpid]  "getpid",
+[SYS_sbrk]    "sbrk",
+[SYS_sleep]   "sleep",
+[SYS_uptime]  "uptime",
+[SYS_open]    "open",
+[SYS_write]   "write",
+[SYS_mknod]   "mknod",
+[SYS_unlink]  "unlink",
+[SYS_link]    "link",
+[SYS_mkdir]   "mkdir",
+[SYS_close]   "close",
+[SYS_trace]   "trace",
+};
+```
+
+```c
+void
+syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+  num = p->trapframe->a7;
+  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    p->trapframe->a0 = syscalls[num]();
+    //在这里检查是否需要跟踪，若需要，则打印跟踪信息
+    if(p->trace_mask >> num & 1){
+      printf("%d: syscall %s -> %d\n", p->pid, syscall_names[num], p->trapframe->a0);
+    }
+  } else {
+    printf("%d %s: unknown sys call %d\n",
+            p->pid, p->name, num);
+    p->trapframe->a0 = -1;
+  }
+}
+```
 
